@@ -78,10 +78,12 @@ def log_movement(order_id, sacs, mouvement, raison):
 def extract_sacs_from_bundle(bundle_name):
     if not bundle_name:
         return 1
-    bundle_lower = bundle_name.lower()
-    for n in range(5, 0, -1):
-        if f"{n} chat" in bundle_lower:
-            return n
+    import re
+    # Cherche un nombre suivi de "chat" (avec ou sans s, avec ou sans parenthèse)
+    # Ex: "(4 chats)", "4 Chats", "1 chat"
+    match = re.search(r'(\d+)\s*[Cc]hat', bundle_name)
+    if match:
+        return int(match.group(1))
     return 1
 
 # Calcul nb sacs depuis line items commande
@@ -131,10 +133,12 @@ def get_active_subscriptions():
 
 def get_subscription_stats():
     subs = get_active_subscriptions()
-    total_abonnes = len(subs)
+    # Filtrer les abonnements à 0€ (livraison offerte, garantie, etc.)
+    subs_reels = [s for s in subs if float(s.get("price", 0)) > 0]
+    total_abonnes = len(subs_reels)
     total_chats = 0
     sacs_par_mois = 0
-    for s in subs:
+    for s in subs_reels:
         titre = s.get("product_title", "") + " " + s.get("variant_title", "")
         nb_chats = extract_sacs_from_bundle(titre)
         total_chats += nb_chats
