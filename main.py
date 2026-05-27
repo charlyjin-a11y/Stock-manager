@@ -334,3 +334,22 @@ scheduler.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/webhook/order-refunded", methods=["POST"])
+def order_refunded():
+    data = request.get_data()
+    if not verify_webhook(data, request.headers.get("X-Shopify-Hmac-Sha256")):
+        return jsonify({"error": "unauthorized"}), 401
+    refund = request.json
+    order_id = refund.get("order_id")
+    sacs_rembourses = 0
+    for item in refund.get("refund_line_items", []):
+        line_item = item.get("line_item", {})
+        if line_item.get("sku") == SHOPIFY_SKU:
+            sacs_rembourses += item.get("quantity", 0)
+    if sacs_rembourses > 0:
+        stock, variant_id = get_current_stock()
+        if variant_id:
+            update_stock(variant_id, stock + sacs_rembourses)
+        log_movement(order_id, sacs_rembourses, "CREDIT", f"Remboursement commande #{order_id}")
+    return jsonify({"ok": True, "sacs_recrédités": sacs_rembourses})
