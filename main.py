@@ -4,13 +4,13 @@ import sqlite3
 import hmac
 import hashlib
 import base64
+import re
 import requests
 from datetime import datetime, timedelta, date
-from flask import Flask, request, jsonify, session, redirect, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "jilypet-secret-2026")
 
 # ── Config ──────────────────────────────────────────────
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN")
@@ -18,7 +18,8 @@ SHOPIFY_SHOP = os.environ.get("SHOPIFY_SHOP", "zhnbdz-03.myshopify.com")
 RECHARGE_TOKEN = os.environ.get("RECHARGE_TOKEN")
 SHOPIFY_SKU = os.environ.get("SHOPIFY_SKU", "AULJP")
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "jilypet2026")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD")
 ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "hello@jilypet.com")
@@ -26,7 +27,7 @@ SEUIL_ALERTE_MOIS = 3
 
 DB_PATH = os.environ.get("DB_PATH", "/data/jilypet.db") if os.path.isdir("/data") else "jilypet.db"
 
-# ── Database ────────────────────────────────────────────
+# ── Database locale (historique seulement) ───────────────
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -35,68 +36,128 @@ def db():
 def init_db():
     conn = db()
     conn.executescript("""
-    CREATE TABLE IF NOT EXISTS conteneurs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL DEFAULT 'litiere',      -- litiere | sacs_plastique
-        reference TEXT,
-        nb_unites INTEGER NOT NULL DEFAULT 0,      -- sacs de litière ou sacs plastique
-        date_commande TEXT,
-        date_debut_preparation TEXT,
-        date_depart_chine TEXT,
-        date_arrivee_france TEXT,
-        recu INTEGER DEFAULT 0,                    -- 1 si arrivé et stocké
-        prix_yuan REAL DEFAULT 0,
-        prix_euro REAL DEFAULT 0,
-        notes TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS paiements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conteneur_id INTEGER,
-        type TEXT NOT NULL,                        -- litiere_30 | litiere_70 | sacs_100
-        montant_euro REAL DEFAULT 0,
-        date_due TEXT,
-        paye INTEGER DEFAULT 0,
-        date_paye TEXT,
-        FOREIGN KEY (conteneur_id) REFERENCES conteneurs(id)
-    );
-    CREATE TABLE IF NOT EXISTS objectifs (
-        mois TEXT PRIMARY KEY,                     -- format YYYY-MM
-        obj_nouveaux_clients INTEGER DEFAULT 0,
-        obj_nouveaux_chats INTEGER DEFAULT 0,
-        reel_nouveaux_clients INTEGER,
-        reel_nouveaux_chats INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS stock_cartons (
-        taille TEXT PRIMARY KEY,                   -- A14 | A13 | A12
-        quantite INTEGER DEFAULT 0,
-        sacs_par_carton TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS stock_sacs_plastique (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        quantite INTEGER DEFAULT 0
-    );
     CREATE TABLE IF NOT EXISTS mouvements (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        type TEXT,                                 -- debit | credit
-        quantite INTEGER,
-        raison TEXT
+        date TEXT, type TEXT, quantite INTEGER, raison TEXT
     );
     CREATE TABLE IF NOT EXISTS historique_stock (
         date TEXT PRIMARY KEY,
-        stock_litiere INTEGER,
-        abonnes INTEGER,
-        chats INTEGER
+        stock_litiere INTEGER, abonnes INTEGER, chats INTEGER
     );
     """)
-    # Init cartons
-    for taille, desc in [("A14","1 sac"),("A13","2 sacs"),("A12","3-4 sacs")]:
-        conn.execute("INSERT OR IGNORE INTO stock_cartons (taille, quantite, sacs_par_carton) VALUES (?,0,?)", (taille, desc))
-    conn.execute("INSERT OR IGNORE INTO stock_sacs_plastique (id, quantite) VALUES (1, 0)")
     conn.commit()
     conn.close()
 
 init_db()
+
+# ── Google Sheets ────────────────────────────────────────
+_sheets_cache = {"data": None, "ts": 0}
+CACHE_SECONDS = 120
+
+def get_sheets_data():
+    """Lit les onglets Conteneurs, Objectifs, Stocks depuis Google Sheets avec cache"""
+    import time
+    now = time.time()
+    if _sheets_cache["data"] and now - _sheets_cache["ts"] < CACHE_SECONDS:
+        return _sheets_cache["data"]
+    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT:
+        return {"conteneurs": [], "objectifs": [], "stocks": {}}
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_info(
+            json.loads(GOOGLE_SERVICE_ACCOUNT),
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+
+        # Conteneurs
+        conteneurs = []
+        try:
+            rows = sh.worksheet("Conteneurs").get_all_values()[1:]
+            for r in rows:
+                r = r + [""] * (13 - len(r))
+                ref, ctype, qte, dcmd, dprep, ddep, darr, pyuan, peuro, p30, p70, masque, notes = r[:13]
+                if not ref or "EXEMPLE" in ref.upper():
+                    continue
+                conteneurs.append({
+                    "reference": ref.strip(),
+                    "type": "sacs_plastique" if "sac" in ctype.lower() else "litiere",
+                    "nb_unites": parse_int(qte),
+                    "date_commande": parse_date(dcmd),
+                    "date_debut_preparation": parse_date(dprep),
+                    "date_depart_chine": parse_date(ddep),
+                    "date_arrivee_france": parse_date(darr),
+                    "prix_yuan": parse_float(pyuan),
+                    "prix_euro": parse_float(peuro),
+                    "paye_30": bool(p30.strip()),
+                    "paye_70": bool(p70.strip()),
+                    "masque": bool(masque.strip()),
+                    "notes": notes.strip(),
+                })
+        except Exception as e:
+            print(f"Sheets Conteneurs error: {e}")
+
+        # Objectifs
+        objectifs = []
+        try:
+            rows = sh.worksheet("Objectifs").get_all_values()[1:]
+            for r in rows:
+                r = r + [""] * (6 - len(r))
+                mois, objc, reelc, objch, reelch, masque = r[:6]
+                if not mois.strip():
+                    continue
+                objectifs.append({
+                    "mois": mois.strip(),
+                    "obj_nouveaux_clients": parse_int(objc),
+                    "reel_nouveaux_clients": parse_int(reelc) if reelc.strip() else None,
+                    "obj_nouveaux_chats": parse_int(objch),
+                    "reel_nouveaux_chats": parse_int(reelch) if reelch.strip() else None,
+                    "masque": bool(masque.strip()),
+                })
+        except Exception as e:
+            print(f"Sheets Objectifs error: {e}")
+
+        # Stocks
+        stocks = {}
+        try:
+            rows = sh.worksheet("Stocks").get_all_values()[1:]
+            for r in rows:
+                if len(r) >= 2 and r[0].strip():
+                    stocks[r[0].strip()] = parse_int(r[1])
+        except Exception as e:
+            print(f"Sheets Stocks error: {e}")
+
+        data = {"conteneurs": conteneurs, "objectifs": objectifs, "stocks": stocks}
+        _sheets_cache["data"] = data
+        _sheets_cache["ts"] = now
+        return data
+    except Exception as e:
+        print(f"Sheets error: {e}")
+        return _sheets_cache["data"] or {"conteneurs": [], "objectifs": [], "stocks": {}}
+
+def parse_int(s):
+    try:
+        return int(str(s).replace(" ", "").replace(",", "").replace("\u202f", "") or 0)
+    except:
+        return 0
+
+def parse_float(s):
+    try:
+        return float(str(s).replace(" ", "").replace(",", ".").replace("€", "").replace("\u202f", "") or 0)
+    except:
+        return 0
+
+def parse_date(s):
+    s = str(s).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except:
+            pass
+    return ""
 
 # ── APIs externes ────────────────────────────────────────
 def shopify_get(endpoint):
@@ -121,7 +182,6 @@ def recharge_get(endpoint):
                      headers={"X-Recharge-Access-Token": RECHARGE_TOKEN}, timeout=30)
     return r.json()
 
-import re
 def extract_chats(titre):
     m = re.search(r'(\d+)\s*[Cc]hat', titre or "")
     return int(m.group(1)) if m else 1
@@ -139,7 +199,6 @@ def get_recharge_stats():
         subs_reels = [s for s in subs if float(s.get("price", 0) or 0) > 0]
         abonnes = len(subs_reels)
         chats = sum(extract_chats((s.get("product_title") or "") + " " + (s.get("variant_title") or "")) for s in subs_reels)
-        # consommation mensuelle projetée
         sacs_mois = 0
         for s in subs_reels:
             nb = extract_chats((s.get("product_title") or "") + " " + (s.get("variant_title") or ""))
@@ -168,7 +227,7 @@ def send_email(subject, html):
     except Exception as e:
         print(f"Email error: {e}")
 
-# ── Jobs planifiés ───────────────────────────────────────
+# ── Jobs ─────────────────────────────────────────────────
 def snapshot_quotidien():
     stock = get_stock_litiere()
     abonnes, chats, _ = get_recharge_stats()
@@ -191,15 +250,13 @@ def check_alertes():
         send_email("⚠️ ALERTE STOCK JILYPET",
             f"<h2>Stock critique</h2><p>Stock: <b>{stock} sacs</b> ({mois_rest:.1f} mois)</p>"
             f"<p>Commander avant le <b>{limite}</b></p>")
-    # Alertes paiements à 15 jours
-    conn = db()
-    prochains = conn.execute("""SELECT p.*, c.reference FROM paiements p
-        LEFT JOIN conteneurs c ON c.id = p.conteneur_id
-        WHERE p.paye = 0 AND p.date_due IS NOT NULL AND p.date_due <> ''
-        AND date(p.date_due) <= date('now', '+15 days')""").fetchall()
-    conn.close()
+    # Paiements sous 15 jours (depuis Sheets)
+    sheets = get_sheets_data()
+    paiements = build_paiements(sheets["conteneurs"])
+    limite15 = (date.today() + timedelta(days=15)).isoformat()
+    prochains = [p for p in paiements if not p["paye"] and p["date_due"] and p["date_due"] <= limite15]
     if prochains:
-        lignes = "".join(f"<li>{p['type']} — {p['montant_euro']:.0f}€ — due {p['date_due']} ({p['reference'] or ''})</li>" for p in prochains)
+        lignes = "".join(f"<li>{p['label']} — {p['montant_euro']:.0f}€ — due {p['date_due']} ({p['reference']})</li>" for p in prochains)
         send_email("💰 Paiements fournisseur à venir", f"<h2>Paiements sous 15 jours</h2><ul>{lignes}</ul>")
 
 scheduler = BackgroundScheduler()
@@ -207,7 +264,33 @@ scheduler.add_job(snapshot_quotidien, "cron", hour=6)
 scheduler.add_job(check_alertes, "cron", day_of_week="mon", hour=8)
 scheduler.start()
 
-# ── Webhooks Shopify (conservés) ─────────────────────────
+# ── Paiements générés depuis conteneurs ──────────────────
+def build_paiements(conteneurs):
+    paiements = []
+    for i, c in enumerate(conteneurs):
+        if c.get("masque"):
+            continue
+        prix = c.get("prix_euro") or 0
+        arrivee = c.get("date_arrivee_france") or ""
+        if prix <= 0:
+            continue
+        if c["type"] == "litiere":
+            due70 = ""
+            if arrivee:
+                try:
+                    due70 = (datetime.fromisoformat(arrivee) + timedelta(days=90)).date().isoformat()
+                except:
+                    pass
+            paiements.append({"id": f"{i}-30", "reference": c["reference"], "label": "Litière 30%",
+                              "montant_euro": round(prix * 0.3, 2), "date_due": arrivee, "paye": c["paye_30"]})
+            paiements.append({"id": f"{i}-70", "reference": c["reference"], "label": "Litière 70%",
+                              "montant_euro": round(prix * 0.7, 2), "date_due": due70, "paye": c["paye_70"]})
+        else:
+            paiements.append({"id": f"{i}-100", "reference": c["reference"], "label": "Sacs plastique 100%",
+                              "montant_euro": prix, "date_due": arrivee, "paye": c["paye_30"]})
+    return paiements
+
+# ── Webhooks Shopify ─────────────────────────────────────
 def verify_webhook(data, hmac_header):
     if not SHOPIFY_WEBHOOK_SECRET:
         return True
@@ -253,26 +336,31 @@ def wh_refunded():
         log_mouvement(qte, "credit", f"Remboursement #{refund.get('order_id')}")
     return jsonify({"ok": True})
 
-# ── API données pour le front ────────────────────────────
+# ── API données front ────────────────────────────────────
 @app.route("/api/data")
 def api_data():
     stock = get_stock_litiere()
     abonnes, chats, sacs_mois = get_recharge_stats()
-    conn = db()
+    sheets = get_sheets_data()
 
-    conteneurs = [dict(r) for r in conn.execute("SELECT * FROM conteneurs ORDER BY date_arrivee_france").fetchall()]
-    paiements = [dict(r) for r in conn.execute("""SELECT p.*, c.reference, c.type as ctype FROM paiements p
-        LEFT JOIN conteneurs c ON c.id = p.conteneur_id ORDER BY p.date_due""").fetchall()]
-    objectifs = [dict(r) for r in conn.execute("SELECT * FROM objectifs ORDER BY mois").fetchall()]
-    cartons = [dict(r) for r in conn.execute("SELECT * FROM stock_cartons").fetchall()]
-    sacs_pl = conn.execute("SELECT quantite FROM stock_sacs_plastique WHERE id=1").fetchone()
+    conteneurs_visibles = [c for c in sheets["conteneurs"] if not c.get("masque")]
+    objectifs_visibles = [o for o in sheets["objectifs"] if not o.get("masque")]
+    paiements = build_paiements(sheets["conteneurs"])
+    stocks = sheets["stocks"]
+
+    conn = db()
     historique = [dict(r) for r in conn.execute("SELECT * FROM historique_stock ORDER BY date DESC LIMIT 90").fetchall()]
     conn.close()
 
     mois_rest = round(stock / sacs_mois, 1) if stock and sacs_mois else 0
     date_limite = (datetime.now() + timedelta(days=mois_rest * 30)).strftime("%d/%m/%Y") if mois_rest else "—"
-    # date limite commande = date rupture - délai fournisseur 3 mois
     date_commande_limite = (datetime.now() + timedelta(days=max(0, (mois_rest - 3) * 30))).strftime("%d/%m/%Y") if mois_rest else "—"
+
+    def find_stock(key_part):
+        for k, v in stocks.items():
+            if key_part.lower() in k.lower():
+                return v
+        return 0
 
     return jsonify({
         "stock_litiere": stock,
@@ -282,138 +370,19 @@ def api_data():
         "date_commande_limite": date_commande_limite,
         "abonnes": abonnes,
         "chats": chats,
-        "stock_sacs_plastique": sacs_pl["quantite"] if sacs_pl else 0,
-        "cartons": cartons,
-        "conteneurs": conteneurs,
+        "stock_sacs_plastique": find_stock("plastique"),
+        "cartons": [
+            {"taille": "A14", "sacs_par_carton": "1 sac", "quantite": find_stock("A14")},
+            {"taille": "A13", "sacs_par_carton": "2 sacs", "quantite": find_stock("A13")},
+            {"taille": "A12", "sacs_par_carton": "3-4 sacs", "quantite": find_stock("A12")},
+        ],
+        "conteneurs": conteneurs_visibles,
         "paiements": paiements,
-        "objectifs": objectifs,
+        "objectifs": objectifs_visibles,
         "historique": historique,
+        "sheets_ok": bool(GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT),
         "maj": datetime.now().strftime("%d/%m/%Y %H:%M"),
     })
-
-# ── Auth admin ───────────────────────────────────────────
-@app.route("/login", methods=["POST"])
-def login():
-    if request.json.get("password") == ADMIN_PASSWORD:
-        session["admin"] = True
-        return jsonify({"ok": True})
-    return jsonify({"ok": False}), 401
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    session.pop("admin", None)
-    return jsonify({"ok": True})
-
-def admin_required():
-    return session.get("admin") == True
-
-# ── API admin ────────────────────────────────────────────
-@app.route("/api/conteneur", methods=["POST"])
-def add_conteneur():
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    d = request.json
-    conn = db()
-    cur = conn.execute("""INSERT INTO conteneurs
-        (type, reference, nb_unites, date_commande, date_debut_preparation, date_depart_chine, date_arrivee_france, prix_yuan, prix_euro, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (d.get("type","litiere"), d.get("reference",""), d.get("nb_unites",0),
-         d.get("date_commande",""), d.get("date_debut_preparation",""),
-         d.get("date_depart_chine",""), d.get("date_arrivee_france",""),
-         d.get("prix_yuan",0), d.get("prix_euro",0), d.get("notes","")))
-    cid = cur.lastrowid
-    # Génère les paiements automatiquement
-    prix = float(d.get("prix_euro") or 0)
-    arrivee = d.get("date_arrivee_france","")
-    if prix > 0:
-        if d.get("type") == "litiere":
-            due70 = ""
-            if arrivee:
-                try:
-                    due70 = (datetime.fromisoformat(arrivee) + timedelta(days=90)).date().isoformat()
-                except: pass
-            conn.execute("INSERT INTO paiements (conteneur_id, type, montant_euro, date_due) VALUES (?,?,?,?)",
-                         (cid, "litiere_30", round(prix*0.3,2), arrivee))
-            conn.execute("INSERT INTO paiements (conteneur_id, type, montant_euro, date_due) VALUES (?,?,?,?)",
-                         (cid, "litiere_70", round(prix*0.7,2), due70))
-        else:
-            conn.execute("INSERT INTO paiements (conteneur_id, type, montant_euro, date_due) VALUES (?,?,?,?)",
-                         (cid, "sacs_100", prix, arrivee))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "id": cid})
-
-@app.route("/api/conteneur/<int:cid>", methods=["PUT", "DELETE"])
-def edit_conteneur(cid):
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    conn = db()
-    if request.method == "DELETE":
-        conn.execute("DELETE FROM paiements WHERE conteneur_id=?", (cid,))
-        conn.execute("DELETE FROM conteneurs WHERE id=?", (cid,))
-    else:
-        d = request.json
-        conn.execute("""UPDATE conteneurs SET type=?, reference=?, nb_unites=?, date_commande=?,
-            date_debut_preparation=?, date_depart_chine=?, date_arrivee_france=?, recu=?, prix_yuan=?, prix_euro=?, notes=?
-            WHERE id=?""",
-            (d.get("type"), d.get("reference"), d.get("nb_unites"), d.get("date_commande"),
-             d.get("date_debut_preparation"), d.get("date_depart_chine"), d.get("date_arrivee_france"),
-             d.get("recu",0), d.get("prix_yuan",0), d.get("prix_euro",0), d.get("notes",""), cid))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-@app.route("/api/paiement/<int:pid>", methods=["PUT"])
-def pay(pid):
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    d = request.json
-    conn = db()
-    conn.execute("UPDATE paiements SET paye=?, date_paye=? WHERE id=?",
-                 (1 if d.get("paye") else 0, datetime.now().date().isoformat() if d.get("paye") else None, pid))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-@app.route("/api/objectif", methods=["POST"])
-def set_objectif():
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    d = request.json
-    conn = db()
-    conn.execute("""INSERT INTO objectifs (mois, obj_nouveaux_clients, obj_nouveaux_chats, reel_nouveaux_clients, reel_nouveaux_chats)
-        VALUES (?,?,?,?,?)
-        ON CONFLICT(mois) DO UPDATE SET obj_nouveaux_clients=excluded.obj_nouveaux_clients,
-        obj_nouveaux_chats=excluded.obj_nouveaux_chats,
-        reel_nouveaux_clients=COALESCE(excluded.reel_nouveaux_clients, objectifs.reel_nouveaux_clients),
-        reel_nouveaux_chats=COALESCE(excluded.reel_nouveaux_chats, objectifs.reel_nouveaux_chats)""",
-        (d["mois"], d.get("obj_nouveaux_clients",0), d.get("obj_nouveaux_chats",0),
-         d.get("reel_nouveaux_clients"), d.get("reel_nouveaux_chats")))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-@app.route("/api/cartons", methods=["POST"])
-def set_cartons():
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    d = request.json
-    conn = db()
-    for taille, qte in d.items():
-        conn.execute("UPDATE stock_cartons SET quantite=? WHERE taille=?", (int(qte), taille))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-@app.route("/api/sacs-plastique", methods=["POST"])
-def set_sacs_pl():
-    if not admin_required():
-        return jsonify({"error": "unauthorized"}), 401
-    conn = db()
-    conn.execute("UPDATE stock_sacs_plastique SET quantite=? WHERE id=1", (int(request.json.get("quantite",0)),))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
 
 @app.route("/health")
 def health():
@@ -432,16 +401,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <title>Jilypet — Gestion Stock</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-:root{--bg:#0d1420;--card:#16202e;--border:#243247;--txt:#e8eef5;--mut:#8ba0b8;--acc:#4da3ff;--ok:#2ecc71;--warn:#f1c40f;--bad:#e74c3c;--purple:#a78bfa;}
+:root{--bg:#0d1420;--card:#16202e;--border:#243247;--txt:#e8eef5;--mut:#8ba0b8;--acc:#4da3ff;--ok:#2ecc71;--warn:#f1c40f;--bad:#e74c3c;}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--txt);padding-bottom:60px}
 .wrap{max-width:1100px;margin:0 auto;padding:16px}
 header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;flex-wrap:wrap;gap:8px}
 h1{font-size:20px}
 .maj{color:var(--mut);font-size:12px}
-.btn{background:var(--acc);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:14px;cursor:pointer}
+.btn{background:var(--acc);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:14px;cursor:pointer;text-decoration:none;display:inline-block}
 .btn.sec{background:var(--border)}
-.btn.danger{background:var(--bad)}
 .grid{display:grid;gap:12px;margin-bottom:16px}
 .g4{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
@@ -453,37 +421,27 @@ h1{font-size:20px}
 .alert{border-radius:12px;padding:14px;margin-bottom:14px;font-size:14px}
 .alert.bad{background:#3d1513;border:1px solid var(--bad);color:#ffb3ad}
 .alert.ok{background:#11301f;border:1px solid var(--ok);color:#a8e6c1}
-.section-title{font-size:16px;font-weight:600;margin:22px 0 10px}
+.alert.info{background:#12283d;border:1px solid var(--acc);color:#a8d4ff}
+.section-title{font-size:16px;font-weight:600;margin:22px 0 10px;display:flex;align-items:center;gap:10px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{color:var(--mut);text-align:left;padding:8px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase}
 td{padding:9px 8px;border-bottom:1px solid var(--border)}
 .tag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
-.tag.ok{background:#11301f;color:var(--ok)}.tag.warn{background:#332a10;color:var(--warn)}.tag.bad{background:#3d1513;color:var(--bad)}.tag.info{background:#12283d;color:var(--acc)}
+.tag.ok{background:#11301f;color:var(--ok)}.tag.warn{background:#332a10;color:var(--warn)}.tag.info{background:#12283d;color:var(--acc)}
 .timeline{display:flex;gap:4px;margin-top:6px}
 .tstep{flex:1;text-align:center;font-size:10px;color:var(--mut)}
 .tdot{width:100%;height:5px;border-radius:3px;background:var(--border);margin-bottom:4px}
 .tdot.done{background:var(--ok)}
-.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;align-items:center;justify-content:center;padding:16px}
-.modal.open{display:flex}
-.mcard{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;width:100%;max-width:460px;max-height:90vh;overflow:auto}
-.mcard h2{font-size:17px;margin-bottom:14px}
-label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px}
-input,select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:9px;font-size:14px}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 canvas{max-height:260px}
-.cal{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.cal{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px}
 .calmois{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px}
 .calmois h4{font-size:12px;color:var(--acc);margin-bottom:6px}
 .calitem{font-size:11px;padding:4px 6px;border-radius:6px;margin-bottom:4px}
 .calitem.due{background:#332a10;color:var(--warn)}
 .calitem.late{background:#3d1513;color:var(--bad)}
 .calitem.paid{background:#11301f;color:var(--ok);text-decoration:line-through;opacity:.6}
-.adm{display:none}
-body.admin .adm{display:block}
-body.admin .admflex{display:flex}
 .pill{font-size:10px;background:var(--border);border-radius:20px;padding:2px 8px;color:var(--mut)}
-@media(max-width:600px){.big{font-size:24px}.row2{grid-template-columns:1fr}}
+@media(max-width:600px){.big{font-size:24px}}
 </style>
 </head>
 <body>
@@ -492,7 +450,7 @@ body.admin .admflex{display:flex}
   <div><h1>🐱 Jilypet — Gestion Stock</h1><div class="maj" id="maj">Chargement…</div></div>
   <div style="display:flex;gap:8px">
     <button class="btn sec" onclick="loadData()">↻ Actualiser</button>
-    <button class="btn" id="adminBtn" onclick="toggleAdmin()">🔒 Admin</button>
+    <a class="btn" id="sheetLink" target="_blank" style="display:none">📝 Modifier (Sheets)</a>
   </div>
 </header>
 
@@ -510,85 +468,24 @@ body.admin .admflex{display:flex}
   <div class="card"><h3>📊 Objectifs vs Réel — nouveaux clients</h3><canvas id="chartObj"></canvas></div>
 </div>
 
-<div class="section-title">🚢 Conteneurs <button class="btn adm" style="font-size:12px;padding:4px 12px" onclick="openConteneur()">+ Ajouter</button></div>
+<div class="section-title">🚢 Conteneurs</div>
 <div class="card" style="overflow-x:auto"><table id="tblCont"><thead><tr>
-<th>Réf</th><th>Type</th><th>Quantité</th><th>Progression</th><th>Arrivée</th><th class="adm">Actions</th>
+<th>Réf</th><th>Type</th><th>Quantité</th><th>Progression</th><th>Statut</th>
 </tr></thead><tbody></tbody></table></div>
 
 <div class="section-title">💰 Calendrier paiements</div>
 <div class="card"><div class="cal" id="calPaiements"></div></div>
 
-<div class="section-title adm">🎯 Objectifs mensuels <button class="btn" style="font-size:12px;padding:4px 12px" onclick="openObjectif()">+ Saisir</button></div>
-<div class="card adm" style="overflow-x:auto"><table id="tblObj"><thead><tr>
+<div class="section-title">🎯 Objectifs mensuels</div>
+<div class="card" style="overflow-x:auto"><table id="tblObj"><thead><tr>
 <th>Mois</th><th>Obj. clients</th><th>Réel clients</th><th>Obj. chats</th><th>Réel chats</th>
 </tr></thead><tbody></tbody></table></div>
 
-<div class="section-title adm">⚙️ Stocks manuels</div>
-<div class="card adm">
-  <div class="row2">
-    <div><label>Cartons A14</label><input type="number" id="inpA14"></div>
-    <div><label>Cartons A13</label><input type="number" id="inpA13"></div>
-  </div>
-  <div class="row2">
-    <div><label>Cartons A12</label><input type="number" id="inpA12"></div>
-    <div><label>Sacs plastique (Chine)</label><input type="number" id="inpSacsPl"></div>
-  </div>
-  <div class="mfoot"><button class="btn" onclick="saveStocks()">💾 Enregistrer</button></div>
 </div>
-
-</div>
-
-<!-- Modal login -->
-<div class="modal" id="modalLogin"><div class="mcard">
-<h2>🔒 Accès admin</h2>
-<label>Mot de passe</label><input type="password" id="pwd" onkeydown="if(event.key==='Enter')doLogin()">
-<div class="mfoot"><button class="btn sec" onclick="closeModals()">Annuler</button><button class="btn" onclick="doLogin()">Connexion</button></div>
-</div></div>
-
-<!-- Modal conteneur -->
-<div class="modal" id="modalCont"><div class="mcard">
-<h2 id="contTitle">🚢 Nouveau conteneur</h2>
-<input type="hidden" id="cId">
-<label>Type</label><select id="cType"><option value="litiere">Litière</option><option value="sacs_plastique">Sacs plastique</option></select>
-<label>Référence bateau</label><input id="cRef" placeholder="ex: MSC-2026-08">
-<label>Quantité (sacs)</label><input type="number" id="cQte">
-<div class="row2">
-<div><label>Date commande</label><input type="date" id="cCmd"></div>
-<div><label>Début préparation</label><input type="date" id="cPrep"></div>
-</div>
-<div class="row2">
-<div><label>Départ Chine</label><input type="date" id="cDep"></div>
-<div><label>Arrivée France</label><input type="date" id="cArr"></div>
-</div>
-<div class="row2">
-<div><label>Prix (yuan)</label><input type="number" step="0.01" id="cYuan"></div>
-<div><label>Prix (€) — base paiements</label><input type="number" step="0.01" id="cEuro"></div>
-</div>
-<label>Notes</label><input id="cNotes">
-<label style="display:flex;align-items:center;gap:8px;margin-top:12px"><input type="checkbox" id="cRecu" style="width:auto"> Conteneur reçu et stocké</label>
-<div class="mfoot">
-<button class="btn danger" id="cDel" style="display:none" onclick="delConteneur()">Supprimer</button>
-<button class="btn sec" onclick="closeModals()">Annuler</button>
-<button class="btn" onclick="saveConteneur()">💾 Enregistrer</button></div>
-</div></div>
-
-<!-- Modal objectif -->
-<div class="modal" id="modalObj"><div class="mcard">
-<h2>🎯 Objectif mensuel</h2>
-<label>Mois</label><input type="month" id="oMois">
-<div class="row2">
-<div><label>Objectif nouveaux clients</label><input type="number" id="oObjC"></div>
-<div><label>Objectif nouveaux chats</label><input type="number" id="oObjCh"></div>
-</div>
-<div class="row2">
-<div><label>Réel clients (fin de mois)</label><input type="number" id="oReelC"></div>
-<div><label>Réel chats (fin de mois)</label><input type="number" id="oReelCh"></div>
-</div>
-<div class="mfoot"><button class="btn sec" onclick="closeModals()">Annuler</button><button class="btn" onclick="saveObjectif()">💾 Enregistrer</button></div>
-</div></div>
 
 <script>
-let DATA=null, chStock=null, chObj=null, isAdmin=false;
+let DATA=null, chStock=null, chObj=null;
+const SHEET_ID = "";  // rempli côté serveur si besoin
 
 async function loadData(){
   const r = await fetch('/api/data'); DATA = await r.json();
@@ -598,61 +495,52 @@ async function loadData(){
 
 function render(){
   const d=DATA;
-  // Alertes
   const az=document.getElementById('alertZone');
-  if(d.mois_restants<3){az.innerHTML=`<div class="alert bad">⚠️ <b>Stock critique !</b> ${d.mois_restants} mois restants (${d.stock_litiere} sacs). Rupture estimée le ${d.date_rupture}. <b>Commander immédiatement.</b></div>`;}
-  else{az.innerHTML=`<div class="alert ok">✅ Stock OK — ${d.mois_restants} mois d'autonomie. Prochaine commande à passer avant le ${d.date_commande_limite}.</div>`;}
+  let alerts='';
+  if(!d.sheets_ok){alerts+=`<div class="alert info">ℹ️ Google Sheets non connecté — configure GOOGLE_SHEET_ID et GOOGLE_SERVICE_ACCOUNT dans Railway.</div>`;}
+  if(d.mois_restants<3){alerts+=`<div class="alert bad">⚠️ <b>Stock critique !</b> ${d.mois_restants} mois restants (${d.stock_litiere?.toLocaleString('fr')} sacs). Rupture estimée le ${d.date_rupture}. <b>Commander immédiatement.</b></div>`;}
+  else{alerts+=`<div class="alert ok">✅ Stock OK — ${d.mois_restants} mois d'autonomie. Prochaine commande avant le ${d.date_commande_limite}.</div>`;}
+  az.innerHTML=alerts;
 
-  // Cards
-  document.getElementById('stockLit').textContent = d.stock_litiere?.toLocaleString('fr')+' sacs';
+  document.getElementById('stockLit').textContent = (d.stock_litiere??0).toLocaleString('fr')+' sacs';
   document.getElementById('stockLitSub').textContent = `${d.mois_restants} mois · ${d.sacs_mois} sacs/mois · rupture ${d.date_rupture}`;
   const pct=Math.min(100,(d.mois_restants/6)*100);
   const bar=document.getElementById('stockLitBar');
   bar.style.width=pct+'%';
   bar.style.background=d.mois_restants<2?'var(--bad)':d.mois_restants<3?'var(--warn)':'var(--ok)';
-  document.getElementById('stockSacs').textContent=d.stock_sacs_plastique?.toLocaleString('fr');
-  document.getElementById('cartonsList').innerHTML=d.cartons.map(c=>`<div style="display:flex;justify-content:space-between;padding:3px 0"><span>${c.taille} <span class="pill">${c.sacs_par_carton}</span></span><b>${c.quantite.toLocaleString('fr')}</b></div>`).join('');
+  document.getElementById('stockSacs').textContent=(d.stock_sacs_plastique??0).toLocaleString('fr');
+  document.getElementById('cartonsList').innerHTML=d.cartons.map(c=>`<div style="display:flex;justify-content:space-between;padding:3px 0"><span>${c.taille} <span class="pill">${c.sacs_par_carton}</span></span><b>${(c.quantite??0).toLocaleString('fr')}</b></div>`).join('');
   document.getElementById('abonnes').textContent=d.abonnes?.toLocaleString('fr')??'—';
-  document.getElementById('chatsSub').textContent=`${d.chats?.toLocaleString('fr')} chats actifs`;
+  document.getElementById('chatsSub').textContent=`${d.chats?.toLocaleString('fr')??'—'} chats actifs`;
 
-  // Conteneurs
+  const now=new Date().toISOString().slice(0,10);
   const tb=document.querySelector('#tblCont tbody');
   tb.innerHTML=d.conteneurs.map(c=>{
     const steps=[['Commande',c.date_commande],['Préparation',c.date_debut_preparation],['Départ',c.date_depart_chine],['Arrivée',c.date_arrivee_france]];
-    const now=new Date().toISOString().slice(0,10);
     const tl='<div class="timeline">'+steps.map(([n,dt])=>`<div class="tstep"><div class="tdot ${dt&&dt<=now?'done':''}"></div>${n}${dt?'<br>'+fmtD(dt):''}</div>`).join('')+'</div>';
-    const badge=c.recu?'<span class="tag ok">✅ Reçu</span>':(c.date_depart_chine&&c.date_depart_chine<=now?'<span class="tag info">🚢 En mer</span>':'<span class="tag warn">🏭 Préparation</span>');
-    return `<tr><td><b>${c.reference||'—'}</b></td><td>${c.type==='litiere'?'Litière':'Sacs pl.'}</td><td>${c.nb_unites.toLocaleString('fr')}</td><td style="min-width:220px">${tl}</td><td>${badge}</td><td class="adm"><button class="btn sec" style="font-size:11px;padding:3px 10px" onclick='openConteneur(${JSON.stringify(c)})'>✏️</button></td></tr>`;
-  }).join('')||'<tr><td colspan="6" style="color:var(--mut)">Aucun conteneur</td></tr>';
+    const arrived=c.date_arrivee_france&&c.date_arrivee_france<=now;
+    const badge=arrived?'<span class="tag ok">✅ Arrivé</span>':(c.date_depart_chine&&c.date_depart_chine<=now?'<span class="tag info">🚢 En mer</span>':'<span class="tag warn">🏭 Préparation</span>');
+    return `<tr><td><b>${c.reference||'—'}</b></td><td>${c.type==='litiere'?'Litière':'Sacs pl.'}</td><td>${(c.nb_unites??0).toLocaleString('fr')}</td><td style="min-width:220px">${tl}</td><td>${badge}</td></tr>`;
+  }).join('')||'<tr><td colspan="5" style="color:var(--mut)">Aucun conteneur visible — ajoute-les dans Google Sheets</td></tr>';
 
-  // Calendrier paiements
   const cal={};
   d.paiements.forEach(p=>{
     if(!p.date_due)return;
     const k=p.date_due.slice(0,7);
     (cal[k]=cal[k]||[]).push(p);
   });
-  const now7=new Date().toISOString().slice(0,10);
   document.getElementById('calPaiements').innerHTML=Object.keys(cal).sort().map(m=>{
     const [y,mo]=m.split('-');
     const nom=['Jan','Fév','Mar','Avr','Mai','Juin','Juil','Août','Sep','Oct','Nov','Déc'][+mo-1]+' '+y;
     return `<div class="calmois"><h4>${nom}</h4>`+cal[m].map(p=>{
-      const cls=p.paye?'paid':(p.date_due<now7?'late':'due');
-      const lbl=p.type==='litiere_30'?'Litière 30%':p.type==='litiere_70'?'Litière 70%':'Sacs 100%';
-      const chk=isAdmin?`<input type="checkbox" ${p.paye?'checked':''} onchange="togglePay(${p.id},this.checked)" style="width:auto;margin-right:4px">`:'';
-      return `<div class="calitem ${cls}">${chk}${lbl} — ${(+p.montant_euro).toLocaleString('fr')}€ <span style="opacity:.7">(${p.reference||''})</span></div>`;
+      const cls=p.paye?'paid':(p.date_due<now?'late':'due');
+      return `<div class="calitem ${cls}">${p.label} — ${(+p.montant_euro).toLocaleString('fr')}€ <span style="opacity:.7">(${p.reference})</span></div>`;
     }).join('')+'</div>';
-  }).join('')||'<div style="color:var(--mut)">Aucun paiement planifié</div>';
+  }).join('')||'<div style="color:var(--mut)">Aucun paiement — saisis les conteneurs avec prix dans Google Sheets</div>';
 
-  // Objectifs table
   const to=document.querySelector('#tblObj tbody');
-  to.innerHTML=d.objectifs.map(o=>`<tr><td>${o.mois}</td><td>${o.obj_nouveaux_clients||0}</td><td>${o.reel_nouveaux_clients??'—'}</td><td>${o.obj_nouveaux_chats||0}</td><td>${o.reel_nouveaux_chats??'—'}</td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--mut)">Aucun objectif saisi</td></tr>';
+  to.innerHTML=d.objectifs.map(o=>`<tr><td>${o.mois}</td><td>${o.obj_nouveaux_clients||0}</td><td>${o.reel_nouveaux_clients??'—'}</td><td>${o.obj_nouveaux_chats||0}</td><td>${o.reel_nouveaux_chats??'—'}</td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--mut)">Aucun objectif — saisis-les dans Google Sheets</td></tr>';
 
-  // Stocks manuels inputs
-  d.cartons.forEach(c=>{const el=document.getElementById('inp'+c.taille);if(el)el.value=c.quantite;});
-  document.getElementById('inpSacsPl').value=d.stock_sacs_plastique;
-
-  // Charts
   drawCharts();
 }
 
@@ -663,7 +551,7 @@ function drawCharts(){
   if(chStock)chStock.destroy();
   chStock=new Chart(document.getElementById('chartStock'),{type:'line',data:{
     labels:h.map(x=>fmtD(x.date)),
-    datasets:[{label:'Stock litière',data:h.map(x=>x.stock_litiere),borderColor:'#4da3ff',backgroundColor:'rgba(77,163,255,.1)',fill:true,tension:.3}]
+    datasets:[{label:'Stock',data:h.map(x=>x.stock_litiere),borderColor:'#4da3ff',backgroundColor:'rgba(77,163,255,.1)',fill:true,tension:.3}]
   },options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8ba0b8',maxTicksLimit:8}},y:{ticks:{color:'#8ba0b8'}}}}});
 
   const o=DATA.objectifs.slice(-12);
@@ -674,69 +562,6 @@ function drawCharts(){
       {label:'Objectif',data:o.map(x=>x.obj_nouveaux_clients),backgroundColor:'rgba(167,139,250,.5)'},
       {label:'Réel',data:o.map(x=>x.reel_nouveaux_clients),backgroundColor:'rgba(46,204,113,.7)'}
     ]},options:{plugins:{legend:{labels:{color:'#8ba0b8'}}},scales:{x:{ticks:{color:'#8ba0b8'}},y:{ticks:{color:'#8ba0b8'}}}}});
-}
-
-// Admin
-function toggleAdmin(){
-  if(isAdmin){fetch('/logout',{method:'POST'});isAdmin=false;document.body.classList.remove('admin');document.getElementById('adminBtn').textContent='🔒 Admin';render();}
-  else{document.getElementById('modalLogin').classList.add('open');}
-}
-async function doLogin(){
-  const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pwd').value})});
-  if(r.ok){isAdmin=true;document.body.classList.add('admin');document.getElementById('adminBtn').textContent='🔓 Quitter admin';closeModals();render();}
-  else alert('Mot de passe incorrect');
-}
-function closeModals(){document.querySelectorAll('.modal').forEach(m=>m.classList.remove('open'));}
-
-function openConteneur(c){
-  document.getElementById('contTitle').textContent=c?'✏️ Modifier conteneur':'🚢 Nouveau conteneur';
-  document.getElementById('cId').value=c?.id||'';
-  document.getElementById('cType').value=c?.type||'litiere';
-  document.getElementById('cRef').value=c?.reference||'';
-  document.getElementById('cQte').value=c?.nb_unites||'';
-  document.getElementById('cCmd').value=c?.date_commande||'';
-  document.getElementById('cPrep').value=c?.date_debut_preparation||'';
-  document.getElementById('cDep').value=c?.date_depart_chine||'';
-  document.getElementById('cArr').value=c?.date_arrivee_france||'';
-  document.getElementById('cYuan').value=c?.prix_yuan||'';
-  document.getElementById('cEuro').value=c?.prix_euro||'';
-  document.getElementById('cNotes').value=c?.notes||'';
-  document.getElementById('cRecu').checked=!!c?.recu;
-  document.getElementById('cDel').style.display=c?'block':'none';
-  document.getElementById('modalCont').classList.add('open');
-}
-async function saveConteneur(){
-  const id=document.getElementById('cId').value;
-  const body={type:cType.value,reference:cRef.value,nb_unites:+cQte.value||0,
-    date_commande:cCmd.value,date_debut_preparation:cPrep.value,date_depart_chine:cDep.value,
-    date_arrivee_france:cArr.value,prix_yuan:+cYuan.value||0,prix_euro:+cEuro.value||0,
-    notes:cNotes.value,recu:document.getElementById('cRecu').checked?1:0};
-  await fetch(id?'/api/conteneur/'+id:'/api/conteneur',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  closeModals();loadData();
-}
-async function delConteneur(){
-  if(!confirm('Supprimer ce conteneur et ses paiements ?'))return;
-  await fetch('/api/conteneur/'+document.getElementById('cId').value,{method:'DELETE'});
-  closeModals();loadData();
-}
-async function togglePay(id,paye){
-  await fetch('/api/paiement/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({paye})});
-  loadData();
-}
-function openObjectif(){document.getElementById('modalObj').classList.add('open');}
-async function saveObjectif(){
-  const body={mois:oMois.value,obj_nouveaux_clients:+oObjC.value||0,obj_nouveaux_chats:+oObjCh.value||0,
-    reel_nouveaux_clients:oReelC.value?+oReelC.value:null,reel_nouveaux_chats:oReelCh.value?+oReelCh.value:null};
-  if(!body.mois)return alert('Choisis un mois');
-  await fetch('/api/objectif',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  closeModals();loadData();
-}
-async function saveStocks(){
-  await fetch('/api/cartons',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({A14:+inpA14.value||0,A13:+inpA13.value||0,A12:+inpA12.value||0})});
-  await fetch('/api/sacs-plastique',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({quantite:+inpSacsPl.value||0})});
-  alert('✅ Stocks enregistrés');loadData();
 }
 
 loadData();
