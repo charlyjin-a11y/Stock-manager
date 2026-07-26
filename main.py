@@ -362,6 +362,14 @@ def api_data():
                 return v
         return 0
 
+    # Sacs plastique consommés par les conteneurs litière commandés
+    # (1 sac de litière = 1 sac plastique utilisé, dès la date de commande)
+    sacs_pl_consommes = sum(
+        c["nb_unites"] for c in sheets["conteneurs"]
+        if c["type"] == "litiere" and c.get("date_commande")
+    )
+    stock_sacs_plastique = find_stock("plastique") - sacs_pl_consommes
+
     return jsonify({
         "stock_litiere": stock,
         "sacs_mois": sacs_mois,
@@ -370,7 +378,7 @@ def api_data():
         "date_commande_limite": date_commande_limite,
         "abonnes": abonnes,
         "chats": chats,
-        "stock_sacs_plastique": find_stock("plastique"),
+        "stock_sacs_plastique": stock_sacs_plastique,
         "cartons": [
             {"taille": "A14", "sacs_par_carton": "1 sac", "quantite": find_stock("A14")},
             {"taille": "A13", "sacs_par_carton": "2 sacs", "quantite": find_stock("A13")},
